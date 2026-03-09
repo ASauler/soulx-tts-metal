@@ -191,7 +191,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=15,
+            n_timesteps=8,
             streaming=streaming
         )  # [B, num_mels, T]
         return feat.float(), h_lengths

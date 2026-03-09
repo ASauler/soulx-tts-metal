@@ -20,6 +20,12 @@ except ImportError:
 from soulxpodcast.config import Config, SamplingParams
 from soulxpodcast.models.modules.sampler import _ras_sample_hf_engine
 
+try:
+    from soulxpodcast.engine.mlx_engine import MLXLLMEngine
+    SUPPORT_MLX = True
+except ImportError:
+    SUPPORT_MLX = False
+
 class HFLLMEngine:
 
     def __init__(self, model, **kwargs):

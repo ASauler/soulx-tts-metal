@@ -8,13 +8,16 @@ from copy import deepcopy
 import numpy as np
 import s3tokenizer
 import torch
-device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-print(f"Using {device} device")
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 from soulxpodcast.config import Config, SamplingParams, AutoPretrainedConfig
 from soulxpodcast.engine.llm_engine import (
-    HFLLMEngine, VLLMEngine
+    HFLLMEngine, VLLMEngine, SUPPORT_MLX
 )
+if SUPPORT_MLX:
+    from soulxpodcast.engine.mlx_engine import MLXLLMEngine
+    import mlx.core as mx
+device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+print(f"Using {device} device")
 from soulxpodcast.models.modules.flow import CausalMaskedDiffWithXvec
 from soulxpodcast.models.modules.hifigan import HiFTGenerator
 
@@ -23,13 +26,20 @@ class SoulXPodcast(torch.nn.Module):
         super().__init__()
         self.config = Config() if config is None else config
 
-        self.audio_tokenizer = s3tokenizer.load_model("speech_tokenizer_v2_25hz").to(device).eval()
-        if self.config.llm_engine == "hf":
+        self._use_mlx = self.config.llm_engine == "mlx" and SUPPORT_MLX
+        pt_device = device
+        if self._use_mlx:
+            print(f"[INFO] MLX mode: LLM on MLX GPU, Flow/HiFi-GAN on PyTorch {pt_device}")
+
+        self.audio_tokenizer = s3tokenizer.load_model("speech_tokenizer_v2_25hz").to(pt_device).eval()
+        if self._use_mlx:
+            self.llm = MLXLLMEngine(**self.config.__dict__)
+        elif self.config.llm_engine == "hf":
             self.llm = HFLLMEngine(**self.config.__dict__)
         elif self.config.llm_engine == "vllm":
             self.llm = VLLMEngine(**self.config.__dict__)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported engine: {self.config.llm_engine}")
 
         self.use_tqdm = True
 
@@ -37,14 +47,16 @@ class SoulXPodcast(torch.nn.Module):
         if self.config.hf_config.fp16_flow:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
             tqdm.write(f"[{timestamp}] - [INFO] - Casting flow to fp16")
-            self.flow.half()
         self.flow.load_state_dict(torch.load(f"{self.config.model}/flow.pt", map_location="cpu", weights_only=True), strict=True)
-        self.flow.to(device).eval()
+        if self.config.hf_config.fp16_flow:
+            self.flow = self.flow.half()
+        self.flow.to(pt_device).eval()
 
         self.hift = HiFTGenerator()
         hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(f"{self.config.model}/hift.pt", map_location="cpu", weights_only=True).items()}
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.to(device).eval()
+        self.hift.to(pt_device).eval()
+        self._pt_device = pt_device
 
     
     @torch.inference_mode()
@@ -68,11 +80,12 @@ class SoulXPodcast(torch.nn.Module):
 
         prompt_size, turn_size = len(prompt_mels_for_llm), len(text_tokens_for_llm)
 
-        # Audio tokenization (CPU 密集型操作)
-        print(f"[DETAIL] 🎵 开始音频 tokenization...")
+        # Audio tokenization
+        dev = self._pt_device if hasattr(self, '_pt_device') else device
+        print(f"[DETAIL] 🎵 开始音频 tokenization (device={dev})...")
         tokenization_start = time.time()
         prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = self.audio_tokenizer.quantize(
-            prompt_mels_for_llm.to(device), prompt_mels_lens_for_llm.to(device)
+            prompt_mels_for_llm.to(dev), prompt_mels_lens_for_llm.to(dev)
         )
         tokenization_time = time.time() - tokenization_start
         print(f"[DETAIL] ✓ 音频 tokenization 完成: {tokenization_time:.3f}s [CPU]")
@@ -92,11 +105,10 @@ class SoulXPodcast(torch.nn.Module):
             if prompt_speech_token_len * 2 > prompt_mel_len:
                 prompt_speech_token = prompt_speech_token[:int(prompt_mel_len/2)]
                 # 🔥 优化: 直接在目标设备上创建
-                prompt_mel_len = torch.tensor([prompt_mel_len], device=device)
+                prompt_mel_len = torch.tensor([prompt_mel_len], device=dev)
             else:
-                prompt_mel = prompt_mel.detach().clone()[:prompt_speech_token_len * 2].to(device)
-                # 🔥 优化: 直接在目标设备上创建
-                prompt_mel_len = torch.tensor([prompt_speech_token_len * 2], device=device)
+                prompt_mel = prompt_mel.detach().clone()[:prompt_speech_token_len * 2].to(dev)
+                prompt_mel_len = torch.tensor([prompt_speech_token_len * 2], device=dev)
             prompt_speech_tokens.append(prompt_speech_token)
             prompt_mels_for_flow.append(prompt_mel)
             prompt_mels_lens_for_flow.append(prompt_mel_len)
@@ -117,6 +129,8 @@ class SoulXPodcast(torch.nn.Module):
                 if i>0:
                     dialect_prompt_input = dialect_prefix[0] + dialect_prompt_input
                 prompt_input = self.llm.generate(dialect_prompt_input, sampling_params, past_key_values=None)['token_ids']
+                if self._use_mlx and dev == "mps":
+                    mx.eval(mx.zeros(1))
                 prompt_inputs.append(dialect_prefix[i+1]+dialect_prompt_text_tokens_for_llm[i] + prompt_input)
                 history_inputs.append(dialect_prefix[i+1]+dialect_prompt_text_tokens_for_llm[i] + prompt_input)
             else:
@@ -131,8 +145,11 @@ class SoulXPodcast(torch.nn.Module):
         print(f"[DETAIL] 🤖 开始 LLM 生成...")
         llm_total_start = time.time()
         inputs = list(chain.from_iterable(prompt_inputs))
-        cache_config = AutoPretrainedConfig().from_dataclass(self.llm.config.hf_config)
-        past_key_values = DynamicCache(config=cache_config)
+        if self._use_mlx:
+            past_key_values = self.llm.make_cache()
+        else:
+            cache_config = AutoPretrainedConfig().from_dataclass(self.llm.config.hf_config)
+            past_key_values = DynamicCache(config=cache_config)
         valid_turn_size = prompt_size
         
         # 初始化计时变量（防止空循环导致未定义错误）
@@ -151,26 +168,31 @@ class SoulXPodcast(torch.nn.Module):
                     prompt_inputs[-self.config.history_context:]
                 ))
                 valid_turn_size = self.config.prompt_context + len(history_inputs) - prompt_text_bound
-                past_key_values = DynamicCache(config=cache_config)
+                if self._use_mlx:
+                    past_key_values = self.llm.make_cache()
+                else:
+                    past_key_values = DynamicCache(config=cache_config)
             valid_turn_size += 1
             
             inputs.extend(text_tokens_for_llm[i])
             start_time = time.time()
             llm_outputs = self.llm.generate(inputs, sampling_params, past_key_values=past_key_values)
+            # Sync MLX before returning to MPS for Flow
+            if self._use_mlx and dev == "mps":
+                mx.eval(mx.zeros(1))  # force MLX to finish
 
             inputs.extend(llm_outputs['token_ids'])
             prompt_inputs.append(text_tokens_for_llm[i]+llm_outputs['token_ids'])
             history_inputs.append(text_tokens_for_llm[i][:-1]) # remove the <|audio_start|>
-            
+
             # Prepare Flow inputs
             turn_spk = spk_ids[i]
             generated_speech_tokens = [token - self.config.hf_config.speech_token_offset for token in  llm_outputs['token_ids'][:-1]]  # ignore last eos
             prompt_speech_token = prompt_speech_tokens[turn_spk].tolist()
-            # 🔥 优化: 直接在目标设备上创建 tensor，避免 CPU→GPU 传输
-            flow_input = torch.tensor([prompt_speech_token + generated_speech_tokens], device=device)
-            flow_inputs_len = torch.tensor([len(prompt_speech_token) + len(generated_speech_tokens)], device=device)
+            flow_input = torch.tensor([prompt_speech_token + generated_speech_tokens], device=dev)
+            flow_inputs_len = torch.tensor([len(prompt_speech_token) + len(generated_speech_tokens)], device=dev)
 
-            # Flow generation and HiFi-GAN generation            
+            # Flow generation and HiFi-GAN generation
             start_idx = spk_ids[i]
             prompt_mels = prompt_mels_for_flow[start_idx][None]
             prompt_mels_lens = prompt_mels_lens_for_flow[start_idx][None]
@@ -178,21 +200,24 @@ class SoulXPodcast(torch.nn.Module):
 
             # Flow generation
             flow_start = time.time()
-            # 使用动态设备类型和精度（支持 CUDA/MPS/CPU）
-            use_autocast = device == "cuda" and self.config.hf_config.fp16_flow
-            if use_autocast:
-                # 只在 CUDA + fp16 时使用 autocast
+            if self.config.hf_config.fp16_flow and dev == "cuda":
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     generated_mels, generated_mels_lens = self.flow(
-                        flow_input, flow_inputs_len,  # 已在正确设备上
-                        prompt_mels, prompt_mels_lens, spk_emb.to(device),
+                        flow_input, flow_inputs_len,
+                        prompt_mels, prompt_mels_lens, spk_emb.to(dev),
                         streaming=False, finalize=True
                     )
-            else:
-                # MPS/CPU 或 fp32：直接推理，不使用 autocast
+            elif self.config.hf_config.fp16_flow and dev == "mps":
                 generated_mels, generated_mels_lens = self.flow(
-                    flow_input, flow_inputs_len,  # 已在正确设备上
-                    prompt_mels, prompt_mels_lens, spk_emb.to(device),
+                    flow_input, flow_inputs_len,
+                    prompt_mels.half(), prompt_mels_lens, spk_emb.half().to(dev),
+                    streaming=False, finalize=True
+                )
+                generated_mels = generated_mels.float()
+            else:
+                generated_mels, generated_mels_lens = self.flow(
+                    flow_input, flow_inputs_len,
+                    prompt_mels, prompt_mels_lens, spk_emb.to(dev),
                     streaming=False, finalize=True
                 )
             flow_time = time.time() - flow_start
@@ -218,8 +243,12 @@ class SoulXPodcast(torch.nn.Module):
         results_dict['generated_wavs'] = generated_wavs
         
         # 总计
+        # Ensure MLX ops complete before next call
+        if self._use_mlx:
+            mx.eval(mx.zeros(1))
+
         total_time = time.time() - total_start
         print(f"[DETAIL] ⏱️  forward_longform 总耗时: {total_time:.3f}s")
         print(f"[DETAIL]   └─ tokenization: {tokenization_time:.3f}s ({tokenization_time/total_time*100:.1f}%)")
-        
+
         return results_dict

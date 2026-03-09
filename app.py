@@ -1,11 +1,15 @@
 import os
 import json
 import time
+import threading
 import torch
 import gradio as gr
 import soundfile as sf
 import io
 import numpy as np
+
+# Metal GPU 全局锁：MLX 和 MPS 并发访问 Metal 会导致 GPU 崩溃
+_gpu_lock = threading.Lock()
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -210,9 +214,10 @@ def warmup_model():
         first_speaker = list(SPEAKERS.keys())[0]
         warmup_text = "系统初始化。"
         
-        # 执行一次完整推理
+        # 执行两次完整推理，确保 MLX JIT 编译完成
         _ = generate_speech(warmup_text, first_speaker, "普通话")
-        
+        _ = generate_speech("你好世界。", first_speaker, "普通话")
+
         elapsed = time.time() - start_time
         print(f"[INFO] ✅ 预热完成！耗时 {elapsed:.2f}s\n")
         is_warmed_up = True
@@ -241,8 +246,8 @@ def load_model():
         model, dataset = initiate_model(
             seed=SEED,
             model_path=MODEL_PATH,
-            llm_engine="hf",
-            fp16_flow=False
+            llm_engine="mlx",
+            fp16_flow=True
         )
         
         print("[INFO] 模型加载完成！\n")
@@ -527,7 +532,8 @@ class PodcastRequest(BaseModel):
 def api_tts(req: TTSRequest):
     """REST API 接口：文本转语音（单人）"""
     try:
-        audio_array = generate_speech(req.text, req.speaker, req.dialect)
+        with _gpu_lock:
+            audio_array = generate_speech(req.text, req.speaker, req.dialect)
 
         # 写入 WAV 格式
         buf = io.BytesIO()
@@ -548,8 +554,9 @@ def api_podcast(req: PodcastRequest):
         script = auto_parse_script(req.script)
         
         # 生成播客
-        audio_array = generate_multiperson_podcast(script, req.silence_duration)
-        
+        with _gpu_lock:
+            audio_array = generate_multiperson_podcast(script, req.silence_duration)
+
         # 写入 WAV 格式
         buf = io.BytesIO()
         sf.write(buf, audio_array, SAMPLE_RATE, format="wav")
@@ -587,11 +594,11 @@ def tts_web(text, speaker, dialect):
     try:
         if not text or len(text.strip()) == 0:
             return None, "请输入文本！"
-        
-        # 记录开始时间
+
         start_time = time.time()
-        
-        audio_array = generate_speech(text, speaker, dialect)
+
+        with _gpu_lock:
+            audio_array = generate_speech(text, speaker, dialect)
         
         # 计算耗时
         elapsed_time = time.time() - start_time
@@ -607,6 +614,72 @@ def tts_web(text, speaker, dialect):
         return None, f"❌ 生成失败: {str(e)}"
 
 
+def asr_recognize(ref_audio):
+    """用 mlx-whisper 识别参考音频文本"""
+    try:
+        if ref_audio is None:
+            return "请先上传参考音频！"
+        import mlx_whisper
+        import tempfile
+        if isinstance(ref_audio, tuple):
+            sr, audio_data = ref_audio
+            tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp_file.name, audio_data, sr)
+            audio_path = tmp_file.name
+        else:
+            audio_path = ref_audio
+        with _gpu_lock:
+            result = mlx_whisper.transcribe(audio_path, language='zh')
+        return result['text'].strip()
+    except Exception as e:
+        return f"识别失败: {str(e)}"
+
+
+def clone_web(text, ref_audio, ref_text, dialect):
+    """Gradio 界面的零样本克隆函数"""
+    try:
+        if not text or len(text.strip()) == 0:
+            return None, "请输入要合成的文本！"
+        if ref_audio is None:
+            return None, "请上传参考音频！"
+        if not ref_text or len(ref_text.strip()) == 0:
+            return None, "请输入参考音频对应的文本！"
+
+        # ref_audio 是 gradio 返回的 (sample_rate, numpy_array)
+        if isinstance(ref_audio, tuple):
+            sr, audio_data = ref_audio
+            import tempfile
+            tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp_file.name, audio_data, sr)
+            ref_audio_path = tmp_file.name
+        else:
+            ref_audio_path = ref_audio
+
+        # 临时注册为说话人，复用 generate_speech
+        clone_key = "__clone_tmp__"
+        SPEAKERS[clone_key] = {
+            "id": "clone",
+            "audio": ref_audio_path,
+            "text": ref_text.strip()
+        }
+
+        start_time = time.time()
+        with _gpu_lock:
+            audio_array = generate_speech(text, clone_key, dialect)
+        elapsed_time = time.time() - start_time
+
+        SPEAKERS.pop(clone_key, None)
+
+        audio_duration = len(audio_array) / SAMPLE_RATE
+        status_msg = f"✅ 克隆生成成功！\n⏱️ 耗时: {elapsed_time:.2f} 秒\n🎵 音频时长: {audio_duration:.2f} 秒"
+        return (SAMPLE_RATE, audio_array), status_msg
+
+    except Exception as e:
+        SPEAKERS.pop("__clone_tmp__", None)
+        import traceback
+        return None, f"❌ 生成失败: {str(e)}\n\n{traceback.format_exc()}"
+
+
 def podcast_web(script_text, silence_duration):
     """Gradio 界面的多人播客生成函数"""
     try:
@@ -620,7 +693,8 @@ def podcast_web(script_text, silence_duration):
         script = auto_parse_script(script_text)
         
         # 生成播客
-        audio_array = generate_multiperson_podcast(script, silence_duration)
+        with _gpu_lock:
+            audio_array = generate_multiperson_podcast(script, silence_duration)
         
         # 计算耗时
         elapsed_time = time.time() - start_time
@@ -695,6 +769,47 @@ with gr.Blocks(title="SoulX Podcast TTS", theme=gr.themes.Soft()) as gr_app:
                 outputs=[audio_output, status_text]
             )
         
+        # ========== 零样本声音克隆 ==========
+        with gr.Tab("🎭 声音克隆"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    clone_text_input = gr.Textbox(
+                        label="要合成的文本",
+                        placeholder="输入想用克隆声音说的话...",
+                        lines=4
+                    )
+                    clone_ref_audio = gr.Audio(
+                        label="上传参考音频（3-15秒，清晰人声）",
+                        type="numpy"
+                    )
+                    clone_ref_text = gr.Textbox(
+                        label="参考音频对应的文本",
+                        placeholder="请准确输入参考音频中说的话（或点击下方按钮自动识别）...",
+                        lines=2
+                    )
+                    asr_btn = gr.Button("🎤 自动识别文本 (Whisper)", size="sm")
+                    clone_dialect = gr.Dropdown(
+                        choices=list(DIALECTS.keys()),
+                        value="普通话",
+                        label="方言"
+                    )
+                    clone_btn = gr.Button("🎭 克隆生成", variant="primary", size="lg")
+
+                with gr.Column(scale=1):
+                    clone_status = gr.Textbox(label="状态", value="就绪", lines=4)
+                    clone_audio_output = gr.Audio(label="克隆语音", type="numpy")
+
+            asr_btn.click(
+                fn=asr_recognize,
+                inputs=[clone_ref_audio],
+                outputs=[clone_ref_text]
+            )
+            clone_btn.click(
+                fn=clone_web,
+                inputs=[clone_text_input, clone_ref_audio, clone_ref_text, clone_dialect],
+                outputs=[clone_audio_output, clone_status]
+            )
+
         # ========== 多人播客生成 ==========
         with gr.Tab("🎙️ 多人播客"):
             with gr.Row():

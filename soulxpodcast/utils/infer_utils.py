@@ -30,7 +30,12 @@ def initiate_model(seed, model_path, llm_engine, fp16_flow):
     config = Config(model=model_path, enforce_eager=True, llm_engine=llm_engine, hf_config=hf_config)
     model = SoulXPodcast(config)
 
-    dataset = PodcastInferHandler(model.llm.tokenizer, None, config)
+    # MLX tokenizer needs wrapping for compatibility
+    tokenizer = model.llm.tokenizer
+    if llm_engine == "mlx":
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    dataset = PodcastInferHandler(tokenizer, None, config)
     
     return model, dataset
 
