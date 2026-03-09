@@ -23,6 +23,10 @@ torchcodec
 # NLP
 s3tokenizer
 
+# Apple Silicon MLX 加速（仅 macOS）
+mlx>=0.22.0; sys_platform == "darwin"
+mlx-lm>=0.22.0; sys_platform == "darwin"
+
 # 其他依赖
 numpy
 pydantic

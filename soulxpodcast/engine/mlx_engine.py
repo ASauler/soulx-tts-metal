@@ -56,8 +56,8 @@ class MLXLLMEngine:
 
         mx.eval(mx.zeros(1))
 
-        # Always create fresh cache per generate call — prompt contains full context
-        cache = make_prompt_cache(self.mlx_model)
+        # Use passed cache for multi-turn KV reuse, or create fresh one
+        cache = past_key_values if past_key_values is not None else make_prompt_cache(self.mlx_model)
 
         sampler = make_sampler(
             temp=sampling_param.temperature,
@@ -72,8 +72,8 @@ class MLXLLMEngine:
         )
 
         # Count speech tokens to detect runaway generation
-        # 25Hz speech tokens → 500 tokens = 20 seconds, plenty for any single turn
-        max_speech_tokens = 500
+        # 25Hz speech tokens, cap at 60% of max_tokens as safety limit
+        max_speech_tokens = max(500, int(sampling_param.max_tokens * 0.6))
         speech_token_count = 0
 
         for (token, logprobs), _ in zip(

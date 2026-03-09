@@ -243,10 +243,25 @@ def load_model():
             )
         
         # 初始化模型
+        # 优先 MLX (Apple Silicon 加速)，不可用则回退 HF
+        try:
+            from soulxpodcast.engine.llm_engine import SUPPORT_MLX
+            mlx_model_path = MODEL_PATH + "-mlx"
+            if SUPPORT_MLX and os.path.exists(mlx_model_path):
+                engine = "mlx"
+            else:
+                engine = "hf"
+                if not SUPPORT_MLX:
+                    print("[INFO] MLX 不可用，使用 HF 引擎")
+                else:
+                    print(f"[INFO] MLX 模型不存在 ({mlx_model_path})，使用 HF 引擎")
+        except Exception:
+            engine = "hf"
+
         model, dataset = initiate_model(
             seed=SEED,
             model_path=MODEL_PATH,
-            llm_engine="mlx",
+            llm_engine=engine,
             fp16_flow=True
         )
         
@@ -655,8 +670,9 @@ def clone_web(text, ref_audio, ref_text, dialect):
         else:
             ref_audio_path = ref_audio
 
-        # 临时注册为说话人，复用 generate_speech
-        clone_key = "__clone_tmp__"
+        # 临时注册为说话人，用唯一 key 防止并发冲突
+        import uuid
+        clone_key = f"__clone_{uuid.uuid4().hex[:8]}__"
         SPEAKERS[clone_key] = {
             "id": "clone",
             "audio": ref_audio_path,
@@ -664,18 +680,18 @@ def clone_web(text, ref_audio, ref_text, dialect):
         }
 
         start_time = time.time()
-        with _gpu_lock:
-            audio_array = generate_speech(text, clone_key, dialect)
+        try:
+            with _gpu_lock:
+                audio_array = generate_speech(text, clone_key, dialect)
+        finally:
+            SPEAKERS.pop(clone_key, None)
         elapsed_time = time.time() - start_time
-
-        SPEAKERS.pop(clone_key, None)
 
         audio_duration = len(audio_array) / SAMPLE_RATE
         status_msg = f"✅ 克隆生成成功！\n⏱️ 耗时: {elapsed_time:.2f} 秒\n🎵 音频时长: {audio_duration:.2f} 秒"
         return (SAMPLE_RATE, audio_array), status_msg
 
     except Exception as e:
-        SPEAKERS.pop("__clone_tmp__", None)
         import traceback
         return None, f"❌ 生成失败: {str(e)}\n\n{traceback.format_exc()}"
 
