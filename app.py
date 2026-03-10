@@ -125,6 +125,9 @@ if not SPEAKERS:
     print("[WARNING] 未找到参考音频，使用空配置")
     SPEAKERS = {}
 
+# 记录内置说话人（启动时扫描到的，不可删除）
+_builtin_speakers = set(SPEAKERS.keys())
+
 # 方言配置
 DIALECTS = {
     "普通话": {"code": "mandarin", "prefix": ""},
@@ -696,6 +699,114 @@ def clone_web(text, ref_audio, ref_text, dialect):
         return None, f"❌ 生成失败: {str(e)}\n\n{traceback.format_exc()}"
 
 
+def save_clone_voice(name, ref_audio, ref_text):
+    """将克隆的声音保存为可复用的说话人"""
+    try:
+        if not name or len(name.strip()) == 0:
+            return "请输入音色名称！", gr.Dropdown(), gr.Dropdown()
+        if ref_audio is None:
+            return "请先上传参考音频！", gr.Dropdown(), gr.Dropdown()
+        if not ref_text or len(ref_text.strip()) == 0:
+            return "请输入参考音频文本！", gr.Dropdown(), gr.Dropdown()
+
+        name = name.strip()
+        if name in SPEAKERS:
+            return f"音色名称 '{name}' 已存在，请换一个！", gr.Dropdown(), gr.Dropdown()
+
+        # 保存音频到 prompt_audios/
+        import shutil
+        safe_name = name.replace(" ", "_").replace("/", "_")
+        wav_path = os.path.join(PROMPT_AUDIO_DIR, f"{safe_name}.wav")
+        txt_path = os.path.join(PROMPT_AUDIO_DIR, f"{safe_name}.txt")
+
+        if isinstance(ref_audio, tuple):
+            sr, audio_data = ref_audio
+            sf.write(wav_path, audio_data, sr)
+        else:
+            shutil.copy2(ref_audio, wav_path)
+
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(ref_text.strip())
+
+        # 注册到 SPEAKERS
+        SPEAKERS[name] = {
+            "id": safe_name,
+            "audio": wav_path,
+            "text": ref_text.strip()
+        }
+
+        # 预加载音频到缓存
+        preload_single_audio(name)
+
+        new_choices = list(SPEAKERS.keys())
+        print(f"[INFO] 音色 '{name}' 已保存到 {wav_path}，当前说话人: {new_choices}")
+        return (
+            f"✅ 音色 '{name}' 已保存！可在「单人语音」中使用。",
+            gr.Dropdown(choices=new_choices, value=name),
+            gr.Dropdown(choices=new_choices, value=None),
+        )
+
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] 保存音色失败: {traceback.format_exc()}")
+        return f"❌ 保存失败: {str(e)}", gr.Dropdown(), gr.Dropdown()
+
+
+def delete_clone_voice(name):
+    """删除已保存的克隆音色"""
+    try:
+        if not name or len(name.strip()) == 0:
+            return "请选择要删除的音色！", gr.Dropdown(), gr.Dropdown()
+
+        name = name.strip()
+        if name not in SPEAKERS:
+            return f"音色 '{name}' 不存在！", gr.Dropdown(), gr.Dropdown()
+
+        spk = SPEAKERS[name]
+        wav_path = spk["audio"]
+        txt_path = wav_path.rsplit(".", 1)[0] + ".txt"
+
+        # 不允许删除原始预设音色（非 prompt_audios 目录下的不删文件）
+        if os.path.exists(wav_path) and PROMPT_AUDIO_DIR in wav_path:
+            os.remove(wav_path)
+        if os.path.exists(txt_path) and PROMPT_AUDIO_DIR in txt_path:
+            os.remove(txt_path)
+
+        # 清理缓存
+        audio_cache.pop(wav_path, None)
+        SPEAKERS.pop(name)
+
+        new_choices = list(SPEAKERS.keys())
+        print(f"[INFO] 音色 '{name}' 已删除，剩余说话人: {new_choices}")
+        return (
+            f"✅ 音色 '{name}' 已删除！",
+            gr.Dropdown(choices=new_choices, value=new_choices[0] if new_choices else None),
+            gr.Dropdown(choices=new_choices, value=None),
+        )
+
+    except Exception as e:
+        return f"❌ 删除失败: {str(e)}", gr.Dropdown(), gr.Dropdown()
+
+
+def _is_builtin_speaker(name):
+    return name in _builtin_speakers
+
+
+def preload_single_audio(speaker_name):
+    """预加载单个说话人的参考音频"""
+    try:
+        spk = SPEAKERS[speaker_name]
+        audio_path = spk["audio"]
+        if audio_path not in audio_cache:
+            audio_data, sr = sf.read(audio_path)
+            if sr != SAMPLE_RATE:
+                import librosa
+                audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=SAMPLE_RATE)
+            audio_cache[audio_path] = (audio_data, SAMPLE_RATE)
+    except Exception as e:
+        print(f"[WARNING] 预加载 {speaker_name} 失败: {e}")
+
+
 def podcast_web(script_text, silence_duration):
     """Gradio 界面的多人播客生成函数"""
     try:
@@ -739,7 +850,16 @@ def podcast_web(script_text, silence_duration):
 
 
 # 创建 Gradio 界面
-with gr.Blocks(title="SoulX Podcast TTS", theme=gr.themes.Soft()) as gr_app:
+_custom_css = """
+#clone-main-row {
+    margin-top: 16px !important;
+}
+#clone-btn {
+    margin-top: -4px !important;
+}
+"""
+
+with gr.Blocks(title="SoulX Podcast TTS") as gr_app:
     gr.Markdown("""
     # 🎙️ SoulX Podcast TTS
     
@@ -787,33 +907,56 @@ with gr.Blocks(title="SoulX Podcast TTS", theme=gr.themes.Soft()) as gr_app:
         
         # ========== 零样本声音克隆 ==========
         with gr.Tab("🎭 声音克隆"):
-            with gr.Row():
-                with gr.Column(scale=2):
-                    clone_text_input = gr.Textbox(
-                        label="要合成的文本",
-                        placeholder="输入想用克隆声音说的话...",
-                        lines=4
-                    )
-                    clone_ref_audio = gr.Audio(
-                        label="上传参考音频（3-15秒，清晰人声）",
-                        type="numpy"
-                    )
-                    clone_ref_text = gr.Textbox(
-                        label="参考音频对应的文本",
-                        placeholder="请准确输入参考音频中说的话（或点击下方按钮自动识别）...",
-                        lines=2
-                    )
-                    asr_btn = gr.Button("🎤 自动识别文本 (Whisper)", size="sm")
-                    clone_dialect = gr.Dropdown(
-                        choices=list(DIALECTS.keys()),
-                        value="普通话",
-                        label="方言"
-                    )
-                    clone_btn = gr.Button("🎭 克隆生成", variant="primary", size="lg")
+            # 音色管理（置顶）
+            with gr.Accordion("💾 已保存的音色", open=False):
+                save_voice_status = gr.Textbox(show_label=False, lines=1, visible=False)
+                save_voice_name = gr.Textbox(
+                    label="音色名称", placeholder="起个名字...", lines=1
+                )
+                save_voice_btn = gr.Button("💾 保存当前音色", size="sm")
+                gr.Markdown("---")
+                delete_voice_dropdown = gr.Dropdown(
+                    choices=list(SPEAKERS.keys()),
+                    label="选择要删除的音色", value=None
+                )
+                delete_voice_btn = gr.Button("🗑️ 删除选中音色", size="sm")
 
-                with gr.Column(scale=1):
-                    clone_status = gr.Textbox(label="状态", value="就绪", lines=4)
-                    clone_audio_output = gr.Audio(label="克隆语音", type="numpy")
+            # 主体：左右两列
+            with gr.Row(elem_id="clone-main-row"):
+                with gr.Column(scale=2):
+                    with gr.Group():
+                        gr.Markdown("#### 1. 设置参考音色")
+                        clone_ref_audio = gr.Audio(
+                            label="上传参考音频（3-15秒清晰人声）",
+                            type="numpy"
+                        )
+                        clone_ref_text = gr.Textbox(
+                            label="参考音频文本",
+                            placeholder="点下面按钮自动识别，或手动输入",
+                            lines=1
+                        )
+                        asr_btn = gr.Button("🎤 自动识别文本", size="sm")
+                with gr.Column(scale=3):
+                    with gr.Group():
+                        gr.Markdown("#### 2. 输入要合成的内容")
+                        clone_text_input = gr.Textbox(
+                            label="合成文本",
+                            placeholder="输入想用这个声音说的话...",
+                            lines=8
+                        )
+                        clone_dialect = gr.Dropdown(
+                            choices=list(DIALECTS.keys()),
+                            value="普通话",
+                            label="方言",
+                        )
+
+            # 克隆按钮（独立一行，全宽）
+            clone_btn = gr.Button("🎭 克隆生成", variant="primary", size="lg", elem_id="clone-btn")
+
+            # 生成结果
+            with gr.Row():
+                clone_audio_output = gr.Audio(label="生成结果", type="numpy")
+                clone_status = gr.Textbox(label="状态", value="就绪", lines=2)
 
             asr_btn.click(
                 fn=asr_recognize,
@@ -824,6 +967,16 @@ with gr.Blocks(title="SoulX Podcast TTS", theme=gr.themes.Soft()) as gr_app:
                 fn=clone_web,
                 inputs=[clone_text_input, clone_ref_audio, clone_ref_text, clone_dialect],
                 outputs=[clone_audio_output, clone_status]
+            )
+            save_voice_btn.click(
+                fn=save_clone_voice,
+                inputs=[save_voice_name, clone_ref_audio, clone_ref_text],
+                outputs=[save_voice_status, speaker_dropdown, delete_voice_dropdown]
+            )
+            delete_voice_btn.click(
+                fn=delete_clone_voice,
+                inputs=[delete_voice_dropdown],
+                outputs=[save_voice_status, speaker_dropdown, delete_voice_dropdown]
             )
 
         # ========== 多人播客生成 ==========
@@ -939,7 +1092,7 @@ with gr.Blocks(title="SoulX Podcast TTS", theme=gr.themes.Soft()) as gr_app:
     """)
 
 # 挂载 Gradio 到 FastAPI
-app = gr.mount_gradio_app(app, gr_app, path="/")
+app = gr.mount_gradio_app(app, gr_app, path="/", theme=gr.themes.Soft(), css=_custom_css)
 
 if __name__ == "__main__":
     import uvicorn
